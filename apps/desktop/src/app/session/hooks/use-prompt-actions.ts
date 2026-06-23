@@ -6,12 +6,23 @@ import { getProfiles, transcribeAudio } from '@/hermes'
 import { translateNow, type Translations, useI18n } from '@/i18n'
 import { stripAnsi } from '@/lib/ansi'
 import { branchGroupForUser, type ChatMessage, chatMessageText, textPart } from '@/lib/chat-messages'
+import { isComposerAstEnabled } from '@/lib/composer-ast-flag'
 import {
   bubbleAttachmentRefsForRow,
   collectInlineOsImageAttachments,
   normalizeInlineRefWireForm,
   stripInlineImageRefs
 } from '@/lib/composer-submit'
+import {
+  collectAttachCandidates,
+  compileToWireText,
+  DOCUMENT_VERSION,
+  importFromWireText,
+  type MessageDocument,
+  mergeAttachmentPillsIntoDocument,
+  normalizeDocument,
+  updateTokenPath
+} from '@/lib/message-document'
 import {
   optimisticAttachmentRef,
   parseCommandDispatch,
@@ -41,6 +52,7 @@ import {
   terminalContextBlocksFromDraft,
   updateComposerAttachment
 } from '@/store/composer'
+import { $composerDocument, clearComposerDocument } from '@/store/composer-document'
 import { resetSessionBackground } from '@/store/composer-status'
 import { clearNotifications, notify, notifyError } from '@/store/notifications'
 import { requestDesktopOnboarding } from '@/store/onboarding'
@@ -48,6 +60,7 @@ import { $activeGatewayProfile, $newChatProfile, ensureGatewayProfile, normalize
 import {
   $busy,
   $connection,
+  $currentCwd,
   $messages,
   $sessions,
   $yoloActive,
@@ -557,13 +570,36 @@ export function usePromptActions({
       const usingComposerAttachments = !options?.attachments
       const baseAttachments = options?.attachments ?? $composerAttachments.get()
 
+      // Flag-on path: live $composerDocument (DOM-synced) or importFromWireText
+      // for queue/programmatic sends. astDoc stays null when the flag is off.
+      let astDoc: MessageDocument | null = null
+
+      if (isComposerAstEnabled()) {
+        const cwd = $currentCwd.get() || ''
+        const live = $composerDocument.get()
+        let doc = live.length > 0 ? live : importFromWireText(rawText.trim())
+
+        if (baseAttachments.length > 0) {
+          doc = mergeAttachmentPillsIntoDocument(doc, baseAttachments, cwd)
+        }
+
+        astDoc = normalizeDocument(doc, cwd)
+      }
+
       const knownPaths = new Set(baseAttachments.map(a => a.path).filter(Boolean))
-      const extraImageAttachments = collectInlineOsImageAttachments(visibleText, baseAttachments)
+      const extraImageAttachments: ComposerAttachment[] = astDoc
+        ? collectAttachCandidates(astDoc)
+            .filter(token => !knownPaths.has(token.path))
+            // Reuse the token id so post-sync `updateTokenPath` can match by id.
+            .map(token => ({ id: token.id, kind: 'image' as const, label: token.displayName, path: token.path }))
+        : collectInlineOsImageAttachments(visibleText, baseAttachments)
       const attachments =
         extraImageAttachments.length > 0 ? [...baseAttachments, ...extraImageAttachments] : baseAttachments
 
+      // Wire text comes from the document on the AST path (token order is wire
+      // order — no pill prepend), and from buildContextText on the legacy path.
       const computeWireText = (atts: ComposerAttachment[], userText: string): string =>
-        buildContextText(atts, userText)
+        astDoc ? compileToWireText(astDoc) : buildContextText(atts, userText)
 
       const terminalContextBlocks = terminalContextBlocksFromDraft(rawText).join('\n\n')
       const hasImage = attachments.some(a => a.kind === 'image')
@@ -591,7 +627,9 @@ export function usePromptActions({
       // from $busy by a separate effect) may still read true — honoring it would
       // bounce the drained send. The drain lock serializes them; the user path
       // keeps the guard so a stray Enter mid-turn can't double-submit.
-      const hasSendable = Boolean(visibleText || terminalContextBlocks || attachments.length || hasImage)
+      const hasSendable = Boolean(
+        visibleText || (astDoc && compileToWireText(astDoc)) || terminalContextBlocks || attachments.length || hasImage
+      )
 
       if (!hasSendable || (!options?.fromQueue && busyRef.current)) {
         return false
@@ -603,13 +641,17 @@ export function usePromptActions({
         const refsForRow = bubbleAttachmentRefsForRow(refs ?? attachmentRefs, partsText ?? visibleText)
         const body =
           partsText ??
-          (visibleText || (attachmentRefs.length ? '' : attachments.map(a => a.label).join(', ')))
+          (astDoc
+            ? compileToWireText(astDoc)
+            : visibleText || (attachmentRefs.length ? '' : attachments.map(a => a.label).join(', ')))
 
         return {
           id: optimisticId,
           role: 'user',
           parts: [textPart(body)],
-          attachmentRefs: refsForRow
+          attachmentRefs: refsForRow,
+          // Attach document so the optimistic bubble matches compileToWireText output.
+          ...(astDoc ? { document: astDoc, documentVersion: DOCUMENT_VERSION } : {})
         }
       }
 
@@ -726,10 +768,28 @@ export function usePromptActions({
         )
         const strippedVisibleText = stripInlineImageRefs(visibleText, attachedImagePaths)
 
+        // AST path: file.attach rewrote staged image paths — fold them back into
+        // the document by token id so the recompiled wire text and the bubble use
+        // the gateway-resolvable workspace path.
+        if (astDoc) {
+          for (const synced of syncedAttachments) {
+            if (synced.kind === 'image' && synced.path) {
+              astDoc = updateTokenPath(astDoc, synced.id, synced.path)
+            }
+          }
+        }
+
         // Rewrite the optimistic bubble with the same string sent to the gateway.
         attachmentRefs = syncedAttachments.map(optimisticAttachmentRef).filter((r): r is string => Boolean(r))
-        const text = buildContextText(syncedAttachments, strippedVisibleText)
+        const text = astDoc ? compileToWireText(astDoc) : buildContextText(syncedAttachments, strippedVisibleText)
         rewriteOptimistic(sessionId, text, attachmentRefs)
+
+        const submitParams: Record<string, unknown> = { session_id: sessionId, text }
+
+        if (astDoc) {
+          submitParams.document = astDoc
+          submitParams.document_version = DOCUMENT_VERSION
+        }
 
         // On sleep/wake the gateway's in-memory session may have been cleared
         // while the desktop app still holds the old session ID. Detect this,
@@ -737,7 +797,7 @@ export function usePromptActions({
         let submitErr: unknown = null
 
         try {
-          await withSessionBusyRetry(() => requestGateway('prompt.submit', { session_id: sessionId, text }))
+          await withSessionBusyRetry(() => requestGateway('prompt.submit', submitParams))
         } catch (firstErr) {
           if (isSessionNotFoundError(firstErr) && selectedStoredSessionIdRef.current) {
             // Re-register the session in the gateway and get a fresh live ID.
@@ -749,7 +809,8 @@ export function usePromptActions({
 
             if (recoveredId) {
               activeSessionIdRef.current = recoveredId
-              await withSessionBusyRetry(() => requestGateway('prompt.submit', { session_id: recoveredId, text }))
+              submitParams.session_id = recoveredId
+              await withSessionBusyRetry(() => requestGateway('prompt.submit', submitParams))
             } else {
               submitErr = firstErr
             }
@@ -764,6 +825,10 @@ export function usePromptActions({
 
         if (usingComposerAttachments) {
           clearComposerAttachments()
+
+          if (astDoc) {
+            clearComposerDocument()
+          }
         }
 
         return true

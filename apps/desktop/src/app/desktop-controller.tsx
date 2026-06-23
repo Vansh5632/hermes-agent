@@ -13,7 +13,7 @@ import { useSkinCommand } from '@/themes/use-skin-command'
 
 import { formatRefValue } from '../components/assistant-ui/directive-text'
 import { getCronJobs, getSessionMessages, listAllProfileSessions, type SessionInfo, triggerCronJob } from '../hermes'
-import { preserveLocalAssistantErrors, toChatMessages } from '../lib/chat-messages'
+import { preserveLocalAssistantErrors, preserveLocalUserDocuments, toChatMessages } from '../lib/chat-messages'
 import {
   isMessagingSource,
   LOCAL_SESSION_SOURCE_IDS,
@@ -587,7 +587,10 @@ export function DesktopController() {
             runtimeSessionId,
             state => ({
               ...state,
-              messages: preserveLocalAssistantErrors(messages, state.messages)
+              messages: preserveLocalUserDocuments(
+                preserveLocalAssistantErrors(messages, state.messages),
+                state.messages
+              )
             }),
             storedSessionId
           )
