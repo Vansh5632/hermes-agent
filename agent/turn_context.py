@@ -68,7 +68,7 @@ def build_turn_context(
     conversation_history: Optional[List[Dict[str, Any]]],
     task_id: Optional[str],
     stream_callback,
-    persist_user_message: Optional[str],
+    persist_user_message: Optional[Any],
     *,
     restore_or_build_system_prompt,
     install_safe_stdio,
