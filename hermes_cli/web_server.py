@@ -115,16 +115,25 @@ def _start_desktop_cron_ticker(stop_event: "threading.Event", interval: int = 60
     Cross-process safe: ``cron.scheduler.tick`` takes the ``cron/.tick.lock``
     file lock, so this never double-fires alongside a real gateway on the same
     HERMES_HOME — whichever process grabs the lock first wins the tick.
+
+    Also runs periodic idle memory trim when ``dashboard.memory.trim`` is enabled.
     """
     from cron.scheduler import tick as cron_tick
+    from hermes_cli.dashboard_memory import memory_trim_enabled, memory_trim_idle_seconds
+    from hermes_cli.mem_trim import trim_memory
 
     _log.info("Desktop cron ticker started (interval=%ds)", interval)
+    trim_enabled = memory_trim_enabled()
+    trim_idle = memory_trim_idle_seconds()
+    started_at = time.time()
     # Tick once up front (catches jobs due at launch), then on the interval.
     while not stop_event.is_set():
         try:
             cron_tick(verbose=False, sync=False)
         except Exception as e:
             _log.debug("Desktop cron tick error: %s", e)
+        if trim_enabled and (time.time() - started_at) >= trim_idle:
+            trim_memory(reason="desktop-idle-ticker")
         stop_event.wait(interval)
 
 
@@ -2771,7 +2780,7 @@ async def search_sessions(q: str = "", limit: int = 20, profile: Optional[str] =
     if not q or not q.strip():
         return {"results": []}
     try:
-        db = _open_session_db_for_profile(profile)
+        db = _open_session_db_for_profile(profile, read_only=True)
         try:
             safe_limit = max(1, min(int(limit or 20), 100))
 
@@ -6466,9 +6475,7 @@ async def get_session_stats(profile: Optional[str] = None):
         messages = db.message_count()
         by_source: Dict[str, int] = {}
         try:
-            for s in db.list_sessions_rich(limit=10000, include_archived=True):
-                src = str(s.get("source") or "cli")
-                by_source[src] = by_source.get(src, 0) + 1
+            by_source = db.session_counts_by_source(include_archived=True)
         except Exception:
             pass
         return {
@@ -6482,19 +6489,30 @@ async def get_session_stats(profile: Optional[str] = None):
         db.close()
 
 
-def _open_session_db_for_profile(profile: Optional[str]):
+def _open_session_db_for_profile(profile: Optional[str], *, read_only: bool = False):
     """Open a SessionDB for read paths, optionally for another profile.
 
     ``profile`` None/empty → this process's own ``state.db`` (the common,
     single-profile case). A named profile opens that profile's on-disk
     ``state.db`` directly so the primary backend can serve cross-profile reads
     (transcripts, detail) without spawning that profile's backend.
+
+    Pass ``read_only=True`` for search/list paths that must not DDL-lock or
+    run schema reconciliation on another profile's live DB.
     """
     from hermes_state import SessionDB
     if not profile:
+        if read_only:
+            from hermes_constants import get_hermes_home
+            db_path = get_hermes_home() / "state.db"
+            if db_path.exists():
+                return SessionDB(db_path=db_path, read_only=True)
         return SessionDB()
     _name, home = _cron_profile_home(profile)
-    return SessionDB(db_path=Path(home) / "state.db")
+    db_path = Path(home) / "state.db"
+    if read_only and db_path.exists():
+        return SessionDB(db_path=db_path, read_only=True)
+    return SessionDB(db_path=db_path)
 
 
 @app.get("/api/sessions/{session_id}")
@@ -11891,6 +11909,17 @@ def start_server(
             print(f"HERMES_DASHBOARD_READY port={actual_port}", flush=True)
             print(f"  Hermes Web UI → http://{host}:{actual_port}")
             _maybe_open_browser(host, actual_port, open_browser, initial_profile)
+
+            def _post_startup_trim():
+                from hermes_cli.mem_trim import trim_memory
+
+                trim_memory(reason="dashboard-ready")
+
+            threading.Thread(
+                target=_post_startup_trim,
+                daemon=True,
+                name="dashboard-post-startup-trim",
+            ).start()
 
             await server.main_loop()
             if server.started:

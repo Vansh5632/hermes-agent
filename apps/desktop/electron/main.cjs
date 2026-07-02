@@ -38,7 +38,7 @@ const { adoptServedDashboardToken } = require('./dashboard-token.cjs')
 const { waitForDashboardPort } = require('./backend-ready.cjs')
 const { serializeJsonBody, setJsonRequestHeaders } = require('./oauth-net-request.cjs')
 const { fetchMarketplaceThemes, searchMarketplaceThemes } = require('./vscode-marketplace.cjs')
-const { buildDesktopBackendEnv, normalizeHermesHomeRoot } = require('./backend-env.cjs')
+const { buildDesktopBackendEnv, buildBackendAllocatorEnv, normalizeHermesHomeRoot } = require('./backend-env.cjs')
 const { readDirForIpc } = require('./fs-read-dir.cjs')
 const { gitRootForIpc } = require('./git-root.cjs')
 const { worktreesForIpc } = require('./git-worktrees.cjs')
@@ -4712,7 +4712,12 @@ async function spawnPoolBackend(profile, entry) {
         // Marks this dashboard backend as desktop-spawned so it runs the cron
         // scheduler tick loop (the gateway isn't running under the app).
         HERMES_DESKTOP: '1',
-        HERMES_WEB_DIST: webDist
+        HERMES_WEB_DIST: webDist,
+        ...buildBackendAllocatorEnv({
+          hermesHome: HERMES_HOME,
+          resourcesPath: process.resourcesPath,
+          appRoot: APP_ROOT
+        })
       },
       shell: backend.shell,
       stdio: ['ignore', 'pipe', 'pipe']
@@ -4929,7 +4934,12 @@ async function startHermes() {
           // Marks this dashboard backend as desktop-spawned so it runs the cron
           // scheduler tick loop (the gateway isn't running under the app).
           HERMES_DESKTOP: '1',
-          HERMES_WEB_DIST: webDist
+          HERMES_WEB_DIST: webDist,
+          ...buildBackendAllocatorEnv({
+            hermesHome: HERMES_HOME,
+            resourcesPath: process.resourcesPath,
+            appRoot: APP_ROOT
+          })
         },
         shell: backend.shell,
         stdio: ['ignore', 'pipe', 'pipe']

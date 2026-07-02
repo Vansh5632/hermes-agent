@@ -107,7 +107,7 @@ T = TypeVar("T")
 
 DEFAULT_DB_PATH = get_hermes_home() / "state.db"
 
-SCHEMA_VERSION = 16
+SCHEMA_VERSION = 17
 
 # ---------------------------------------------------------------------------
 # WAL-compatibility fallback
@@ -545,6 +545,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     handoff_error TEXT,
     rewind_count INTEGER NOT NULL DEFAULT 0,
     archived INTEGER NOT NULL DEFAULT 0,
+    last_active REAL,
     FOREIGN KEY (parent_session_id) REFERENCES sessions(id)
 );
 
@@ -585,6 +586,7 @@ CREATE INDEX IF NOT EXISTS idx_sessions_source ON sessions(source);
 CREATE INDEX IF NOT EXISTS idx_sessions_source_id ON sessions(source, id);
 CREATE INDEX IF NOT EXISTS idx_sessions_parent ON sessions(parent_session_id);
 CREATE INDEX IF NOT EXISTS idx_sessions_started ON sessions(started_at DESC);
+CREATE INDEX IF NOT EXISTS idx_sessions_last_active ON sessions(last_active DESC);
 CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, timestamp);
 CREATE INDEX IF NOT EXISTS idx_compression_locks_expires ON compression_locks(expires_at);
 """
@@ -686,6 +688,7 @@ class SessionDB:
         self._fts_enabled = False
         self._fts_unavailable_warned = False
         self._conn = None
+        self._session_count_cache: Dict[str, Tuple[float, int]] = {}
         try:
             if read_only:
                 # Read-only attach for cross-profile aggregation: SELECT-only,
@@ -871,6 +874,37 @@ class SessionDB:
             self._warn_fts5_unavailable(exc)
             return False
 
+    def _invalidate_session_count_cache(self) -> None:
+        self._session_count_cache.clear()
+
+    def _session_count_cache_key(self, **kwargs) -> str:
+        return json.dumps(kwargs, sort_keys=True, default=str)
+
+    @staticmethod
+    def _bump_last_active(conn, session_id: str, ts: float) -> None:
+        """Update last_active on a session and its parent chain."""
+        frontier = [session_id]
+        seen: set[str] = set()
+        while frontier:
+            sid = frontier.pop()
+            if not sid or sid in seen:
+                continue
+            seen.add(sid)
+            conn.execute(
+                "UPDATE sessions SET last_active = CASE "
+                "WHEN COALESCE(last_active, 0) > ? THEN last_active ELSE ? END "
+                "WHERE id = ?",
+                (ts, ts, sid),
+            )
+            row = conn.execute(
+                "SELECT parent_session_id FROM sessions WHERE id = ?", (sid,)
+            ).fetchone()
+            parent_id = row[0] if row and not isinstance(row, sqlite3.Row) else (
+                row["parent_session_id"] if row else None
+            )
+            if parent_id:
+                frontier.append(parent_id)
+
     def _execute_write(self, fn: Callable[[sqlite3.Connection], T]) -> T:
         """Execute a write transaction with BEGIN IMMEDIATE and jitter retry.
 
@@ -902,6 +936,7 @@ class SessionDB:
                         raise
                 # Success — periodic best-effort checkpoint.
                 self._write_count += 1
+                self._invalidate_session_count_cache()
                 if self._write_count % self._CHECKPOINT_EVERY_N_WRITES == 0:
                     self._try_wal_checkpoint()
                 return result
@@ -1231,6 +1266,20 @@ class SessionDB:
                         "            WHERE m.session_id = sessions.id AND m.role = 'tool') "
                         "AND NOT EXISTS (SELECT 1 FROM sessions ch "
                         "                WHERE ch.parent_session_id = sessions.id)"
+                    )
+                except sqlite3.OperationalError:
+                    pass
+            if current_version < 17:
+                # v17: denormalized last_active for fast recent-session ordering.
+                try:
+                    cursor.execute(
+                        "UPDATE sessions SET last_active = ("
+                        "  SELECT MAX(m.timestamp) FROM messages m WHERE m.session_id = sessions.id"
+                        ") WHERE last_active IS NULL"
+                    )
+                    cursor.execute(
+                        "UPDATE sessions SET last_active = started_at "
+                        "WHERE last_active IS NULL"
                     )
                 except sqlite3.OperationalError:
                     pass
@@ -2060,7 +2109,25 @@ class SessionDB:
         # order_by_last_active path (which builds the chain CTE); other callers
         # pass id_query=None.
         id_needle = (id_query or "").strip().lower()
-        if order_by_last_active:
+        if order_by_last_active and not id_needle:
+            query = f"""
+                SELECT s.*,
+                    COALESCE(
+                        (SELECT SUBSTR(REPLACE(REPLACE(m.content, X'0A', ' '), X'0D', ' '), 1, 63)
+                         FROM messages m
+                         WHERE m.session_id = s.id AND m.role = 'user' AND m.content IS NOT NULL
+                         ORDER BY m.timestamp, m.id LIMIT 1),
+                        ''
+                    ) AS _preview_raw,
+                    COALESCE(s.last_active, s.started_at) AS last_active,
+                    COALESCE(s.last_active, s.started_at) AS _effective_last_active
+                FROM sessions s
+                {where_sql}
+                ORDER BY COALESCE(s.last_active, s.started_at) DESC, s.started_at DESC, s.id DESC
+                LIMIT ? OFFSET ?
+            """
+            params.extend([limit, offset])
+        elif order_by_last_active:
             # Compute effective_last_active by walking each surfaced session's
             # compression-continuation chain forward in SQL and taking the MAX
             # timestamp across the chain. This lets us ORDER BY + LIMIT at SQL
@@ -2411,6 +2478,7 @@ class SessionDB:
             num_tool_calls = len(tool_calls) if isinstance(tool_calls, list) else 1
 
         def _do(conn):
+            msg_ts = time.time()
             cursor = conn.execute(
                 """INSERT INTO messages (session_id, role, content, tool_call_id,
                    tool_calls, tool_name, timestamp, token_count, finish_reason,
@@ -2424,7 +2492,7 @@ class SessionDB:
                     tool_call_id,
                     tool_calls_json,
                     tool_name,
-                    time.time(),
+                    msg_ts,
                     token_count,
                     finish_reason,
                     reasoning,
@@ -2450,6 +2518,7 @@ class SessionDB:
                     "UPDATE sessions SET message_count = message_count + 1 WHERE id = ?",
                     (session_id,),
                 )
+            SessionDB._bump_last_active(conn, session_id, msg_ts)
             return msg_id
 
         return self._execute_write(_do)
@@ -2537,6 +2606,8 @@ class SessionDB:
                 "UPDATE sessions SET message_count = ?, tool_call_count = ? WHERE id = ?",
                 (total_messages, total_tool_calls, session_id),
             )
+            if total_messages > 0:
+                SessionDB._bump_last_active(conn, session_id, now_ts - 1e-6)
 
         self._execute_write(_do)
 
@@ -3630,6 +3701,9 @@ class SessionDB:
         archived_only: bool = False,
         exclude_children: bool = False,
         exclude_sources: List[str] = None,
+        *,
+        use_cache: bool = True,
+        cache_ttl: float = 5.0,
     ) -> int:
         """Count sessions, optionally filtered by source.
 
@@ -3645,6 +3719,19 @@ class SessionDB:
         cron-excluded ``list_sessions_rich`` page and doesn't keep "load more"
         stuck on for buried scheduler sessions).
         """
+        cache_key = self._session_count_cache_key(
+            source=source,
+            min_message_count=min_message_count,
+            include_archived=include_archived,
+            archived_only=archived_only,
+            exclude_children=exclude_children,
+            exclude_sources=exclude_sources,
+        )
+        if use_cache:
+            cached = self._session_count_cache.get(cache_key)
+            if cached and (time.time() - cached[0]) < cache_ttl:
+                return cached[1]
+
         where_clauses = []
         params = []
 
@@ -3673,7 +3760,29 @@ class SessionDB:
 
         with self._lock:
             cursor = self._conn.execute(f"SELECT COUNT(*) FROM sessions s{where_sql}", params)
-            return cursor.fetchone()[0]
+            count = int(cursor.fetchone()[0])
+        if use_cache:
+            self._session_count_cache[cache_key] = (time.time(), count)
+        return count
+
+    def session_counts_by_source(
+        self,
+        *,
+        include_archived: bool = True,
+    ) -> Dict[str, int]:
+        """Return session counts grouped by source (SQL aggregate, no row fetch)."""
+        where_clauses: List[str] = []
+        params: List[Any] = []
+        if not include_archived:
+            where_clauses.append("archived = 0")
+        where_sql = f" WHERE {' AND '.join(where_clauses)}" if where_clauses else ""
+        with self._lock:
+            cursor = self._conn.execute(
+                f"SELECT COALESCE(source, 'cli') AS src, COUNT(*) "
+                f"FROM sessions{where_sql} GROUP BY src",
+                params,
+            )
+            return {str(row[0]): int(row[1]) for row in cursor.fetchall()}
 
     def message_count(self, session_id: str = None) -> int:
         """Count messages, optionally for a specific session."""
