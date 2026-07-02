@@ -80,10 +80,7 @@ test('normalizeHermesHomeRoot maps profile homes back to the global Hermes root'
     normalizeHermesHomeRoot('C:\\Users\\test\\AppData\\Local\\hermes\\profiles\\oracle', { pathModule: path.win32 }),
     'C:\\Users\\test\\AppData\\Local\\hermes'
   )
-  assert.equal(
-    normalizeHermesHomeRoot('/Users/test/.hermes', { pathModule: path.posix }),
-    '/Users/test/.hermes'
-  )
+  assert.equal(normalizeHermesHomeRoot('/Users/test/.hermes', { pathModule: path.posix }), '/Users/test/.hermes')
 })
 
 test('Windows PATH casing and delimiter are preserved without POSIX sane entries', () => {
@@ -108,10 +105,7 @@ test('Windows PATH casing and delimiter are preserved without POSIX sane entries
 })
 
 test('appendUniquePathEntries drops empty entries and keeps first occurrence', () => {
-  assert.equal(
-    appendUniquePathEntries([':/a::/b', ['/a', '/c']], { delimiter: ':' }),
-    '/a:/b:/c'
-  )
+  assert.equal(appendUniquePathEntries([':/a::/b', ['/a', '/c']], { delimiter: ':' }), '/a:/b:/c')
 })
 
 test('readDashboardAllocatorPreloadEnabled respects allocator: system in config', () => {
