@@ -44,7 +44,11 @@
     "fmt": "prettier --write 'src/**/*.{ts,tsx}' 'electron/**/*.{js,cjs}' 'vite.config.ts'",
     "fix": "npm run lint:fix && npm run fmt",
     "test:ui": "vitest run --environment jsdom",
-    "preview": "node scripts/assert-root-install.cjs && vite preview --host 127.0.0.1 --port 4174"
+    "preview": "node scripts/assert-root-install.cjs && vite preview --host 127.0.0.1 --port 4174",
+    "investigate:dashboard-memory": "bash investigation/scripts/run-dashboard-memory-matrix.sh",
+    "investigate:dashboard-memory:summary": "bash investigation/scripts/print-memory-summary.sh",
+    "investigate:dashboard-memory:electron": "bash investigation/scripts/run-electron-memory.sh",
+    "investigate:allocator-memory": "bash investigation/scripts/run-allocator-memory-matrix.sh"
   },
   "dependencies": {
     "@assistant-ui/react": "^0.12.28",
